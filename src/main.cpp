@@ -125,10 +125,10 @@ static const unsigned long TRACTION_SAMPLE_MS = 50;
 static const unsigned long GAMEPAD_OTA_HOLD_MS = 3000;
 static const char* VIBRATION_CHAR_UUID = "91680002-1111-6666-8888-0123456789ab";
 static const unsigned long VIBRATION_MIN_INTERVAL_MS = 120;
-static const int VIBRATION_WHEEL_SPEED_MIN = 1;
-static const int VIBRATION_WHEEL_SPEED_MAX = 25;
-static const uint8_t VIBRATION_MIN_RUNNING_STRENGTH = 70;
-static const uint8_t VIBRATION_MAX_RUNNING_STRENGTH = 230;
+static const int VIBRATION_WHEEL_DIFF_MIN = 2;
+static const int VIBRATION_WHEEL_DIFF_MAX = 20;
+static const uint8_t VIBRATION_MIN_TURN_STRENGTH = 70;
+static const uint8_t VIBRATION_MAX_TURN_STRENGTH = 230;
 static int tractionLimitPercent = 100;
 static unsigned long lastTractionSampleMs = 0;
 static float lastLeftWheelSpeed = 0.0f;
@@ -591,25 +591,22 @@ void updateWheelSpeedVibration(float leftWheelSpeed, float rightWheelSpeed, int 
 
     int leftAbs = static_cast<int>(fabs(leftWheelSpeed));
     int rightAbs = static_cast<int>(fabs(rightWheelSpeed));
-    uint8_t leftStrength = 0;
-    uint8_t rightStrength = 0;
+    int diff = leftAbs - rightAbs;
+    int diffAbs = abs(diff);
 
-    if (leftAbs >= VIBRATION_WHEEL_SPEED_MIN) {
-        leftStrength = static_cast<uint8_t>(
-            constrain(map(leftAbs, VIBRATION_WHEEL_SPEED_MIN, VIBRATION_WHEEL_SPEED_MAX,
-                          VIBRATION_MIN_RUNNING_STRENGTH, VIBRATION_MAX_RUNNING_STRENGTH),
-                      VIBRATION_MIN_RUNNING_STRENGTH, VIBRATION_MAX_RUNNING_STRENGTH)
-        );
+    if (diffAbs < VIBRATION_WHEEL_DIFF_MIN) {
+        stopGamepadVibration();
+        return;
     }
 
-    if (rightAbs >= VIBRATION_WHEEL_SPEED_MIN) {
-        rightStrength = static_cast<uint8_t>(
-            constrain(map(rightAbs, VIBRATION_WHEEL_SPEED_MIN, VIBRATION_WHEEL_SPEED_MAX,
-                          VIBRATION_MIN_RUNNING_STRENGTH, VIBRATION_MAX_RUNNING_STRENGTH),
-                      VIBRATION_MIN_RUNNING_STRENGTH, VIBRATION_MAX_RUNNING_STRENGTH)
-        );
-    }
+    uint8_t strength = static_cast<uint8_t>(
+        constrain(map(diffAbs, VIBRATION_WHEEL_DIFF_MIN, VIBRATION_WHEEL_DIFF_MAX,
+                      VIBRATION_MIN_TURN_STRENGTH, VIBRATION_MAX_TURN_STRENGTH),
+                  VIBRATION_MIN_TURN_STRENGTH, VIBRATION_MAX_TURN_STRENGTH)
+    );
 
+    uint8_t leftStrength = diff < 0 ? strength : 0;   // Right wheel faster: left turn.
+    uint8_t rightStrength = diff > 0 ? strength : 0;  // Left wheel faster: right turn.
     writeGamepadVibration(leftStrength, rightStrength);
 }
 
