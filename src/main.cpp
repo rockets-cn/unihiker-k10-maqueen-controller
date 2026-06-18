@@ -31,6 +31,7 @@ void handleOtaUpload();
 void scheduleRestart();
 void startWifiMaintenance();
 void connectSta();
+void loadPairCode();
 void handleRoot();
 void handleWifiSave();
 String htmlEscape(const String& value);
@@ -59,7 +60,7 @@ static const uint16_t HID_SERVICE_UUID_val = 0x1812;
 #define DEFAULT_STA_PASS "dfrobot@2017"        // 默认 STA WiFi 密码
 
 // ====== 绑定配置 ======
-#define PAIR_CODE   80794                      // 5位哈希绑定码
+#define PAIR_CODE   32652                      // 默认5位哈希绑定码
 volatile uint32_t pairCode = PAIR_CODE;
 
 // ====== 实体对象声明 ======
@@ -112,6 +113,8 @@ static const int PIVOT_RAMP_STEP = 14;
 static const int TRACTION_RELEASE_PERCENT = 78;
 static const int TRACTION_RECOVER_STEP = 3;
 static const int ACCEL_JOLT_THRESHOLD = 180;
+static const uint16_t GAMEPAD_CONTROL_HANDLE = 0x0015;
+static const uint16_t GAMEPAD_NOTIFY_HANDLE = 0x0017;
 static const uint8_t GAMEPAD_MOTOR_FLAGS = 0x00;
 static const uint8_t GAMEPAD_MOTOR_MAX = 255;
 static const int GAMEPAD_MOTOR_DEADBAND = 12;
@@ -290,6 +293,7 @@ void setup() {
     pClient = NimBLEDevice::createClient();
     pClient->setClientCallbacks(new MyClientCallback(), false);
 
+    loadPairCode();
     Serial.printf("[系统就绪] 当前设定手柄绑定码: %05u\n", pairCode);
     startWifiMaintenance();
     
@@ -377,11 +381,17 @@ bool connectToServer() {
     int successCount = 0;
     for (size_t i = 0; i < charList.size(); i++) {
         NimBLERemoteCharacteristic* pChar = charList[i];
-        NimBLERemoteDescriptor* pCcDescriptor = pChar->getDescriptor(NimBLEUUID((uint16_t)0x2902));
-        if (gamepadControlChar == nullptr && (pChar->canWrite() || pChar->canWriteNoResponse()) && pCcDescriptor == nullptr) {
+
+        if (pChar->getHandle() == GAMEPAD_CONTROL_HANDLE && (pChar->canWrite() || pChar->canWriteNoResponse())) {
             gamepadControlChar = pChar;
-            Serial.printf("[INFO] Found gamepad motor control characteristic: %s\n", pChar->getUUID().toString().c_str());
+            Serial.printf("[INFO] Found gamepad control characteristic: handle=0x%04x uuid=%s\n",
+                          pChar->getHandle(), pChar->getUUID().toString().c_str());
+            continue;
         }
+
+        if (pChar->getHandle() != GAMEPAD_NOTIFY_HANDLE && !pChar->canNotify() && !pChar->canIndicate()) continue;
+
+        NimBLERemoteDescriptor* pCcDescriptor = pChar->getDescriptor(NimBLEUUID((uint16_t)0x2902));
         if (pCcDescriptor != nullptr) {
             uint8_t val[2] = {0x01, 0x00};
             pCcDescriptor->writeValue(val, 2, true);
@@ -706,6 +716,12 @@ void connectSta() {
     WiFi.begin(staSsid.c_str(), staPass.c_str());
 }
 
+void loadPairCode() {
+    wifiPrefs.begin("wifi", true);
+    pairCode = wifiPrefs.getUInt("pair", PAIR_CODE);
+    wifiPrefs.end();
+}
+
 void handleRoot() {
     String html = "<html><head><title>Maqueen WiFi</title>";
     html += "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">";
@@ -723,7 +739,9 @@ void handleRoot() {
     html += htmlEscape(staSsid);
     html += "\"></label></p><p><label>Password <input name=\"password\" type=\"password\" value=\"";
     html += htmlEscape(staPass);
-    html += "\"></label></p><button type=\"submit\">Save WiFi</button></form>";
+    html += "\"></label></p><p><label>Pair Code <input name=\"pair\" inputmode=\"numeric\" pattern=\"[0-9]{5}\" maxlength=\"5\" value=\"";
+    html += String(pairCode);
+    html += "\"></label></p><button type=\"submit\">Save</button></form>";
     html += "<p>OTA: POST firmware to /ota?token=&lt;token&gt;</p></body></html>";
     server.send(200, "text/html", html);
 }
@@ -735,6 +753,18 @@ void handleWifiSave() {
         wifiPrefs.begin("wifi", false);
         wifiPrefs.putString("ssid", staSsid);
         wifiPrefs.putString("pass", staPass);
+        if (server.hasArg("pair")) {
+            uint32_t newPairCode = server.arg("pair").toInt();
+            if (newPairCode >= 10000 && newPairCode <= 99999) {
+                pairCode = newPairCode;
+                wifiPrefs.putUInt("pair", pairCode);
+                targetFound = false;
+                reconnectFailCount = 0;
+                if (pClient != nullptr && pClient->isConnected()) {
+                    pClient->disconnect();
+                }
+            }
+        }
         wifiPrefs.end();
         connectSta();
     }
