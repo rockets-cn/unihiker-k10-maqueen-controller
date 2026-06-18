@@ -29,15 +29,22 @@ void controlCarWithSpeed(uint16_t x, uint16_t y);
 void handleOta();
 void handleOtaUpload();
 void scheduleRestart();
+void processOtaModeRequest();
 void startWifiMaintenance();
 void connectSta();
 void loadPairCode();
 void handleRoot();
 void handleWifiSave();
+bool handleGamepadOtaCommand(bool ltPressed, bool rtPressed);
 String htmlEscape(const String& value);
 int applyDeadband(int value, int deadband);
 int rampToward(int current, int target, int maxStep);
 int updateTractionLimit(int leftTarget, int rightTarget, int forwardAbs, int turnAbs);
+void findVibrationCharacteristic();
+bool writeGamepadVibration(uint8_t left, uint8_t right, bool force = false);
+void stopGamepadVibration();
+void startSensorVibration(uint8_t left, uint8_t right, unsigned long durationMs);
+void updateGamepadVibration();
 void driveMotor(DFRobot_MaqueenPlusV2::Dir motor, int speed);
 void resetDriveState();
 
@@ -67,6 +74,7 @@ UNIHIKER_K10          k10;
 DFRobot_MaqueenPlusV2  maqueenPlus;
 Preferences           wifiPrefs;
 NimBLEClient* pClient = nullptr;
+NimBLERemoteCharacteristic* vibrationChar = nullptr;
 WebServer             server(OTA_PORT);        // OTA Web 服务器
 
 // ====== 状态全局变量 ======
@@ -81,8 +89,11 @@ static String annotation = "";
 // ====== OTA 模式变量 ======
 volatile bool otaUploadActive = false;         // OTA upload in progress
 bool wifiMaintenanceStarted = false;
+volatile bool otaControlRequested = false;
+bool otaHoldActive = false;
 bool restartPending = false;
 unsigned long restartAtMs = 0;
+unsigned long otaHoldStartMs = 0;
 String staSsid = DEFAULT_STA_SSID;
 String staPass = DEFAULT_STA_PASS;
 
@@ -111,12 +122,23 @@ static const int TRACTION_RELEASE_PERCENT = 78;
 static const int TRACTION_RECOVER_STEP = 3;
 static const int ACCEL_JOLT_THRESHOLD = 180;
 static const unsigned long TRACTION_SAMPLE_MS = 50;
+static const unsigned long GAMEPAD_OTA_HOLD_MS = 3000;
+static const char* VIBRATION_CHAR_UUID = "91680002-1111-6666-8888-0123456789ab";
+static const unsigned long VIBRATION_MIN_INTERVAL_MS = 180;
+static const unsigned long VIBRATION_PULSE_MS = 90;
+static const uint8_t VIBRATION_MAX_SENSOR_STRENGTH = 180;
 static int tractionLimitPercent = 100;
 static unsigned long lastTractionSampleMs = 0;
 static float lastLeftWheelSpeed = 0.0f;
 static float lastRightWheelSpeed = 0.0f;
 static int lastAccelStrength = 0;
 static bool tractionSampleReady = false;
+static bool vibrationActive = false;
+static uint8_t currentVibrationLeft = 0;
+static uint8_t currentVibrationRight = 0;
+static unsigned long vibrationStopAtMs = 0;
+static unsigned long lastVibrationWriteMs = 0;
+static unsigned long lastVibrationStartMs = 0;
 
 // ====== 函数声明 ======
 void scanDevices();
@@ -156,6 +178,10 @@ class MyClientCallback : public NimBLEClientCallbacks {
 
     void onDisconnect(NimBLEClient* pClient, int reason) {
         deviceConnected = false;
+        vibrationChar = nullptr;
+        vibrationActive = false;
+        currentVibrationLeft = 0;
+        currentVibrationRight = 0;
         digitalWrite(LED_STATUS, LOW);
         resetDriveState();
         maqueenPlus.motorStop(maqueenPlus.ALL); // Safety protection: emergency stop on disconnect
@@ -192,6 +218,7 @@ void notifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t le
     // ---- 1. 解析主要动作按键 (Byte 5) ----
     bool btn_LT_digital  = (pData[6] & 0x01) != 0;  // LT 触底按键
     bool btn_RT_digital  = (pData[6] & 0x02) != 0;  // RT 触底按键
+    if (handleGamepadOtaCommand(btn_LT_digital, btn_RT_digital)) return;
     if (otaUploadActive) return;
 
     // ---- 2. 解析左摇杆模拟量 (Byte 0 和 Byte 1，范围 0~255) ----
@@ -222,6 +249,7 @@ void notifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t le
         // 恢复中位值并停车
         joyX = JOY_MID;
         joyY = JOY_MID;
+        stopGamepadVibration();
         resetDriveState();
         maqueenPlus.motorStop(maqueenPlus.ALL);
         Serial.println("手柄触发：停止录像 & 紧急停车");
@@ -243,6 +271,42 @@ void notifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t le
         }
         // MOTOR_MAX = map(right_stick_y, 255, 0, 50, 255);
     }
+}
+
+bool handleGamepadOtaCommand(bool ltPressed, bool rtPressed) {
+    if (wifiMaintenanceStarted || otaUploadActive) return ltPressed && rtPressed;
+
+    if (ltPressed && rtPressed) {
+        unsigned long now = millis();
+        if (!otaHoldActive) {
+            otaHoldActive = true;
+            otaHoldStartMs = now;
+            lastGAMEPAD = "STOP";
+            joyX = JOY_MID;
+            joyY = JOY_MID;
+            stopGamepadVibration();
+            resetDriveState();
+            maqueenPlus.motorStop(maqueenPlus.ALL);
+            maqueenPlus.set_rgbLed(2, 0x00FFFF);
+            ledOn = false;
+            Serial.println("[OTA] Hold LT+RT for 3 seconds to enable WiFi/OTA mode.");
+        }
+
+        if (!otaControlRequested && now - otaHoldStartMs >= GAMEPAD_OTA_HOLD_MS) {
+            otaControlRequested = true;
+            otaHoldActive = false;
+            maqueenPlus.set_rgbLed(2, 0x00FF00);
+            Serial.println("[OTA] Gamepad command accepted; enabling WiFi/OTA mode.");
+        }
+        return true;
+    }
+
+    if (otaHoldActive) {
+        otaHoldActive = false;
+        maqueenPlus.set_rgbLed(2, 0x000000);
+        Serial.println("[OTA] Gamepad OTA command cancelled.");
+    }
+    return false;
 }
 
 // ==================== 主初始化程序 ====================
@@ -281,7 +345,8 @@ void setup() {
 
     loadPairCode();
     Serial.printf("[系统就绪] 当前设定手柄绑定码: %05u\n", pairCode);
-    startWifiMaintenance();
+    WiFi.mode(WIFI_OFF);
+    Serial.println("[系统就绪] WiFi is off. Hold LT+RT for 3 seconds to enable OTA/config mode.");
     
     delay(1000);
     maqueenPlus.set_rgbLed(2, 0x000000); // 初始化完成，熄灭麦昆车灯
@@ -289,10 +354,15 @@ void setup() {
 
 // ==================== 主循环调度程序 ====================
 void loop() {
-    server.handleClient();
+    if (wifiMaintenanceStarted) {
+        server.handleClient();
+    }
     scheduleRestart();
+    processOtaModeRequest();
+    updateGamepadVibration();
 
-    if (otaUploadActive) {
+    if (wifiMaintenanceStarted || otaUploadActive) {
+        stopGamepadVibration();
         maqueenPlus.motorStop(maqueenPlus.ALL);
         delay(5);
         return;
@@ -354,6 +424,7 @@ bool connectToServer() {
     delay(1000);
     pClient->exchangeMTU();
     pClient->discoverAttributes();
+    findVibrationCharacteristic();
 
     NimBLERemoteService* pHidService = pClient->getService(NimBLEUUID(HID_SERVICE_UUID_val));
     if (pHidService == nullptr) {
@@ -455,6 +526,83 @@ int rampToward(int current, int target, int maxStep) {
     return current + (delta > 0 ? maxStep : -maxStep);
 }
 
+void findVibrationCharacteristic() {
+    vibrationChar = nullptr;
+    if (pClient == nullptr || !pClient->isConnected()) return;
+
+    NimBLEUUID targetUuid(VIBRATION_CHAR_UUID);
+    const std::vector<NimBLERemoteService*>& serviceList = pClient->getServices(false);
+
+    for (size_t i = 0; i < serviceList.size(); i++) {
+        NimBLERemoteService* service = serviceList[i];
+        if (service == nullptr) continue;
+
+        const std::vector<NimBLERemoteCharacteristic*>& charList = service->getCharacteristics(false);
+        for (size_t j = 0; j < charList.size(); j++) {
+            NimBLERemoteCharacteristic* pChar = charList[j];
+            if (pChar == nullptr) continue;
+            if (!pChar->getUUID().equals(targetUuid)) continue;
+            if (!pChar->canWrite() && !pChar->canWriteNoResponse()) continue;
+
+            vibrationChar = pChar;
+            Serial.printf("[INFO] Vibration characteristic ready: uuid=%s handle=0x%04x\n",
+                          pChar->getUUID().toString().c_str(), pChar->getHandle());
+            return;
+        }
+    }
+
+    Serial.println("[INFO] Vibration characteristic not found; sensor feedback disabled.");
+}
+
+bool writeGamepadVibration(uint8_t left, uint8_t right, bool force) {
+    if (!deviceConnected || otaUploadActive || vibrationChar == nullptr) return false;
+
+    unsigned long now = millis();
+    if (!force &&
+        left == currentVibrationLeft &&
+        right == currentVibrationRight &&
+        now - lastVibrationWriteMs < VIBRATION_MIN_INTERVAL_MS) {
+        return false;
+    }
+
+    uint8_t packet[6] = {0x10, 0x04, 0x08, 0x00, left, right};
+    if (!vibrationChar->writeValue(packet, sizeof(packet), false)) {
+        return false;
+    }
+
+    currentVibrationLeft = left;
+    currentVibrationRight = right;
+    lastVibrationWriteMs = now;
+    return true;
+}
+
+void stopGamepadVibration() {
+    vibrationActive = false;
+    vibrationStopAtMs = 0;
+    if (currentVibrationLeft == 0 && currentVibrationRight == 0) return;
+    writeGamepadVibration(0, 0, true);
+}
+
+void startSensorVibration(uint8_t left, uint8_t right, unsigned long durationMs) {
+    if (!deviceConnected || vibrationChar == nullptr || otaUploadActive) return;
+
+    unsigned long now = millis();
+    if (now - lastVibrationStartMs < VIBRATION_MIN_INTERVAL_MS) return;
+
+    if (writeGamepadVibration(left, right, true)) {
+        vibrationActive = true;
+        vibrationStopAtMs = now + durationMs;
+        lastVibrationStartMs = now;
+    }
+}
+
+void updateGamepadVibration() {
+    if (!vibrationActive) return;
+    if (!deviceConnected || otaUploadActive || millis() >= vibrationStopAtMs) {
+        stopGamepadVibration();
+    }
+}
+
 void driveMotor(DFRobot_MaqueenPlusV2::Dir motor, int speed) {
     if (speed > 0) {
         maqueenPlus.motorRun(motor, maqueenPlus.CW, speed);
@@ -490,6 +638,8 @@ int updateTractionLimit(int leftTarget, int rightTarget, int forwardAbs, int tur
     bool pivotingFast = forwardAbs <= 20 && turnAbs > HIGH_SPEED_TURN_START;
     bool steeringFast = forwardAbs > HIGH_SPEED_TURN_START && turnAbs > (MOTOR_MAX * 45 / 100);
     bool slipRisk = false;
+    uint8_t vibrationLeft = 0;
+    uint8_t vibrationRight = 0;
 
     if (tractionSampleReady && highCommand) {
         float leftDelta = fabs(leftWheelSpeed - lastLeftWheelSpeed);
@@ -508,6 +658,26 @@ int updateTractionLimit(int leftTarget, int rightTarget, int forwardAbs, int tur
         if (accelDelta > ACCEL_JOLT_THRESHOLD && (pivotingFast || steeringFast)) {
             slipRisk = true;
         }
+
+        if (slipRisk) {
+            int wheelFeedback = constrain(map(static_cast<int>(wheelDelta), 8, 35, 45, VIBRATION_MAX_SENSOR_STRENGTH),
+                                          45, VIBRATION_MAX_SENSOR_STRENGTH);
+            int accelFeedback = constrain(map(accelDelta, ACCEL_JOLT_THRESHOLD, ACCEL_JOLT_THRESHOLD * 3,
+                                          45, VIBRATION_MAX_SENSOR_STRENGTH),
+                                          45, VIBRATION_MAX_SENSOR_STRENGTH);
+            uint8_t strength = static_cast<uint8_t>(max(wheelFeedback, accelFeedback));
+
+            if (leftDelta > rightDelta + 3.0f || leftWheelSpeed > rightWheelSpeed + 8.0f) {
+                vibrationLeft = strength;
+                vibrationRight = strength / 2;
+            } else if (rightDelta > leftDelta + 3.0f || rightWheelSpeed > leftWheelSpeed + 8.0f) {
+                vibrationLeft = strength / 2;
+                vibrationRight = strength;
+            } else {
+                vibrationLeft = strength;
+                vibrationRight = strength;
+            }
+        }
     }
 
     lastLeftWheelSpeed = leftWheelSpeed;
@@ -516,6 +686,7 @@ int updateTractionLimit(int leftTarget, int rightTarget, int forwardAbs, int tur
     tractionSampleReady = true;
 
     if (slipRisk) {
+        startSensorVibration(vibrationLeft, vibrationRight, VIBRATION_PULSE_MS);
         tractionLimitPercent = TRACTION_RELEASE_PERCENT;
     } else if (tractionLimitPercent < 100) {
         tractionLimitPercent = min(100, tractionLimitPercent + TRACTION_RECOVER_STEP);
@@ -622,6 +793,26 @@ void scheduleRestart() {
   if (restartPending && millis() >= restartAtMs) {
     ESP.restart();
   }
+}
+
+void processOtaModeRequest() {
+    if (!otaControlRequested || wifiMaintenanceStarted) return;
+
+    otaControlRequested = false;
+    lastGAMEPAD = "STOP";
+    joyX = JOY_MID;
+    joyY = JOY_MID;
+    stopGamepadVibration();
+    resetDriveState();
+    maqueenPlus.motorStop(maqueenPlus.ALL);
+
+    if (pClient != nullptr && pClient->isConnected()) {
+        pClient->disconnect();
+    }
+    targetFound = false;
+    reconnectFailCount = 0;
+
+    startWifiMaintenance();
 }
 
 bool isOtaAuthorized() {
