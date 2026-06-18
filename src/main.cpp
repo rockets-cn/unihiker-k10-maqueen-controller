@@ -38,8 +38,6 @@ String htmlEscape(const String& value);
 int applyDeadband(int value, int deadband);
 int rampToward(int current, int target, int maxStep);
 int updateTractionLimit(int leftTarget, int rightTarget, int forwardAbs, int turnAbs);
-void sendGamepadMotorFeedback(uint16_t x);
-void stopGamepadMotorFeedback();
 void driveMotor(DFRobot_MaqueenPlusV2::Dir motor, int speed);
 void resetDriveState();
 
@@ -69,7 +67,6 @@ UNIHIKER_K10          k10;
 DFRobot_MaqueenPlusV2  maqueenPlus;
 Preferences           wifiPrefs;
 NimBLEClient* pClient = nullptr;
-NimBLERemoteCharacteristic* gamepadControlChar = nullptr;
 WebServer             server(OTA_PORT);        // OTA Web 服务器
 
 // ====== 状态全局变量 ======
@@ -113,12 +110,6 @@ static const int PIVOT_RAMP_STEP = 14;
 static const int TRACTION_RELEASE_PERCENT = 78;
 static const int TRACTION_RECOVER_STEP = 3;
 static const int ACCEL_JOLT_THRESHOLD = 180;
-static const uint16_t GAMEPAD_CONTROL_HANDLE = 0x0015;
-static const uint16_t GAMEPAD_NOTIFY_HANDLE = 0x0017;
-static const uint8_t GAMEPAD_MOTOR_FLAGS = 0x00;
-static const uint8_t GAMEPAD_MOTOR_MAX = 255;
-static const int GAMEPAD_MOTOR_DEADBAND = 12;
-static const unsigned long GAMEPAD_MOTOR_WRITE_MS = 40;
 static const unsigned long TRACTION_SAMPLE_MS = 50;
 static int tractionLimitPercent = 100;
 static unsigned long lastTractionSampleMs = 0;
@@ -126,9 +117,6 @@ static float lastLeftWheelSpeed = 0.0f;
 static float lastRightWheelSpeed = 0.0f;
 static int lastAccelStrength = 0;
 static bool tractionSampleReady = false;
-static uint8_t lastGamepadLeftMotor = 0;
-static uint8_t lastGamepadRightMotor = 0;
-static unsigned long lastGamepadMotorWriteMs = 0;
 
 // ====== 函数声明 ======
 void scanDevices();
@@ -168,7 +156,6 @@ class MyClientCallback : public NimBLEClientCallbacks {
 
     void onDisconnect(NimBLEClient* pClient, int reason) {
         deviceConnected = false;
-        gamepadControlChar = nullptr;
         digitalWrite(LED_STATUS, LOW);
         resetDriveState();
         maqueenPlus.motorStop(maqueenPlus.ALL); // Safety protection: emergency stop on disconnect
@@ -235,7 +222,6 @@ void notifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t le
         // 恢复中位值并停车
         joyX = JOY_MID;
         joyY = JOY_MID;
-        stopGamepadMotorFeedback();
         resetDriveState();
         maqueenPlus.motorStop(maqueenPlus.ALL);
         Serial.println("手柄触发：停止录像 & 紧急停车");
@@ -382,14 +368,7 @@ bool connectToServer() {
     for (size_t i = 0; i < charList.size(); i++) {
         NimBLERemoteCharacteristic* pChar = charList[i];
 
-        if (pChar->getHandle() == GAMEPAD_CONTROL_HANDLE && (pChar->canWrite() || pChar->canWriteNoResponse())) {
-            gamepadControlChar = pChar;
-            Serial.printf("[INFO] Found gamepad control characteristic: handle=0x%04x uuid=%s\n",
-                          pChar->getHandle(), pChar->getUUID().toString().c_str());
-            continue;
-        }
-
-        if (pChar->getHandle() != GAMEPAD_NOTIFY_HANDLE && !pChar->canNotify() && !pChar->canIndicate()) continue;
+        if (!pChar->canNotify() && !pChar->canIndicate()) continue;
 
         NimBLERemoteDescriptor* pCcDescriptor = pChar->getDescriptor(NimBLEUUID((uint16_t)0x2902));
         if (pCcDescriptor != nullptr) {
@@ -476,53 +455,6 @@ int rampToward(int current, int target, int maxStep) {
     return current + (delta > 0 ? maxStep : -maxStep);
 }
 
-void sendGamepadMotorFeedback(uint16_t x) {
-    if (!deviceConnected || gamepadControlChar == nullptr) return;
-
-    int turn = static_cast<int>(x) - JOY_MID;
-    uint8_t leftMotor = 0;
-    uint8_t rightMotor = 0;
-
-    if (abs(turn) > GAMEPAD_MOTOR_DEADBAND) {
-        uint8_t motorValue = static_cast<uint8_t>(
-            constrain(map(abs(turn), GAMEPAD_MOTOR_DEADBAND, JOY_MID - 1, 0, GAMEPAD_MOTOR_MAX), 0, GAMEPAD_MOTOR_MAX)
-        );
-        if (turn < 0) {
-            leftMotor = motorValue;
-        } else {
-            rightMotor = motorValue;
-        }
-    }
-
-    unsigned long now = millis();
-    if (leftMotor == lastGamepadLeftMotor &&
-        rightMotor == lastGamepadRightMotor &&
-        now - lastGamepadMotorWriteMs < GAMEPAD_MOTOR_WRITE_MS) {
-        return;
-    }
-
-    uint8_t packet[6] = {0x10, 0x04, 0x08, GAMEPAD_MOTOR_FLAGS, leftMotor, rightMotor};
-    if (gamepadControlChar->writeValue(packet, sizeof(packet), false)) {
-        lastGamepadLeftMotor = leftMotor;
-        lastGamepadRightMotor = rightMotor;
-        lastGamepadMotorWriteMs = now;
-    }
-}
-
-void stopGamepadMotorFeedback() {
-    if (!deviceConnected || gamepadControlChar == nullptr) {
-        lastGamepadLeftMotor = 0;
-        lastGamepadRightMotor = 0;
-        return;
-    }
-
-    uint8_t packet[6] = {0x10, 0x04, 0x08, GAMEPAD_MOTOR_FLAGS, 0x00, 0x00};
-    gamepadControlChar->writeValue(packet, sizeof(packet), false);
-    lastGamepadLeftMotor = 0;
-    lastGamepadRightMotor = 0;
-    lastGamepadMotorWriteMs = millis();
-}
-
 void driveMotor(DFRobot_MaqueenPlusV2::Dir motor, int speed) {
     if (speed > 0) {
         maqueenPlus.motorRun(motor, maqueenPlus.CW, speed);
@@ -600,7 +532,6 @@ void controlCarWithSpeed(uint16_t x, uint16_t y) {
 
     targetForward = applyDeadband(targetForward, 12);
     targetTurn = applyDeadband(targetTurn, 12);
-    sendGamepadMotorFeedback(x);
 
     bool pivotCommand = abs(targetForward) <= 20 && abs(targetTurn) > HIGH_SPEED_TURN_START;
     filteredForward = rampToward(filteredForward, targetForward, 18);
