@@ -43,7 +43,7 @@ int updateTractionLimit(int leftTarget, int rightTarget, int forwardAbs, int tur
 void findVibrationCharacteristic();
 bool writeGamepadVibration(uint8_t left, uint8_t right, bool force = false);
 void stopGamepadVibration();
-void startSensorVibration(uint8_t left, uint8_t right, unsigned long durationMs);
+void updateWheelSpeedVibration(float leftWheelSpeed, float rightWheelSpeed, int commandAbs);
 void updateGamepadVibration();
 void driveMotor(DFRobot_MaqueenPlusV2::Dir motor, int speed);
 void resetDriveState();
@@ -124,21 +124,20 @@ static const int ACCEL_JOLT_THRESHOLD = 180;
 static const unsigned long TRACTION_SAMPLE_MS = 50;
 static const unsigned long GAMEPAD_OTA_HOLD_MS = 3000;
 static const char* VIBRATION_CHAR_UUID = "91680002-1111-6666-8888-0123456789ab";
-static const unsigned long VIBRATION_MIN_INTERVAL_MS = 180;
-static const unsigned long VIBRATION_PULSE_MS = 90;
-static const uint8_t VIBRATION_MAX_SENSOR_STRENGTH = 180;
+static const unsigned long VIBRATION_MIN_INTERVAL_MS = 120;
+static const int VIBRATION_WHEEL_SPEED_MIN = 1;
+static const int VIBRATION_WHEEL_SPEED_MAX = 25;
+static const uint8_t VIBRATION_MIN_RUNNING_STRENGTH = 70;
+static const uint8_t VIBRATION_MAX_RUNNING_STRENGTH = 230;
 static int tractionLimitPercent = 100;
 static unsigned long lastTractionSampleMs = 0;
 static float lastLeftWheelSpeed = 0.0f;
 static float lastRightWheelSpeed = 0.0f;
 static int lastAccelStrength = 0;
 static bool tractionSampleReady = false;
-static bool vibrationActive = false;
 static uint8_t currentVibrationLeft = 0;
 static uint8_t currentVibrationRight = 0;
-static unsigned long vibrationStopAtMs = 0;
 static unsigned long lastVibrationWriteMs = 0;
-static unsigned long lastVibrationStartMs = 0;
 
 // ====== 函数声明 ======
 void scanDevices();
@@ -179,7 +178,6 @@ class MyClientCallback : public NimBLEClientCallbacks {
     void onDisconnect(NimBLEClient* pClient, int reason) {
         deviceConnected = false;
         vibrationChar = nullptr;
-        vibrationActive = false;
         currentVibrationLeft = 0;
         currentVibrationRight = 0;
         digitalWrite(LED_STATUS, LOW);
@@ -395,6 +393,8 @@ void loop() {
     // 3. Only allow joystick to drive car when in “START” state
     if (deviceConnected && (lastGAMEPAD == "START")) {
         controlCarWithSpeed(joyX, joyY);
+    } else {
+        stopGamepadVibration();
     }
 
     delay(10); // Maintain underlying task stability
@@ -577,28 +577,44 @@ bool writeGamepadVibration(uint8_t left, uint8_t right, bool force) {
 }
 
 void stopGamepadVibration() {
-    vibrationActive = false;
-    vibrationStopAtMs = 0;
     if (currentVibrationLeft == 0 && currentVibrationRight == 0) return;
     writeGamepadVibration(0, 0, true);
 }
 
-void startSensorVibration(uint8_t left, uint8_t right, unsigned long durationMs) {
+void updateWheelSpeedVibration(float leftWheelSpeed, float rightWheelSpeed, int commandAbs) {
     if (!deviceConnected || vibrationChar == nullptr || otaUploadActive) return;
 
-    unsigned long now = millis();
-    if (now - lastVibrationStartMs < VIBRATION_MIN_INTERVAL_MS) return;
-
-    if (writeGamepadVibration(left, right, true)) {
-        vibrationActive = true;
-        vibrationStopAtMs = now + durationMs;
-        lastVibrationStartMs = now;
+    if (commandAbs < 8) {
+        stopGamepadVibration();
+        return;
     }
+
+    int leftAbs = static_cast<int>(fabs(leftWheelSpeed));
+    int rightAbs = static_cast<int>(fabs(rightWheelSpeed));
+    uint8_t leftStrength = 0;
+    uint8_t rightStrength = 0;
+
+    if (leftAbs >= VIBRATION_WHEEL_SPEED_MIN) {
+        leftStrength = static_cast<uint8_t>(
+            constrain(map(leftAbs, VIBRATION_WHEEL_SPEED_MIN, VIBRATION_WHEEL_SPEED_MAX,
+                          VIBRATION_MIN_RUNNING_STRENGTH, VIBRATION_MAX_RUNNING_STRENGTH),
+                      VIBRATION_MIN_RUNNING_STRENGTH, VIBRATION_MAX_RUNNING_STRENGTH)
+        );
+    }
+
+    if (rightAbs >= VIBRATION_WHEEL_SPEED_MIN) {
+        rightStrength = static_cast<uint8_t>(
+            constrain(map(rightAbs, VIBRATION_WHEEL_SPEED_MIN, VIBRATION_WHEEL_SPEED_MAX,
+                          VIBRATION_MIN_RUNNING_STRENGTH, VIBRATION_MAX_RUNNING_STRENGTH),
+                      VIBRATION_MIN_RUNNING_STRENGTH, VIBRATION_MAX_RUNNING_STRENGTH)
+        );
+    }
+
+    writeGamepadVibration(leftStrength, rightStrength);
 }
 
 void updateGamepadVibration() {
-    if (!vibrationActive) return;
-    if (!deviceConnected || otaUploadActive || millis() >= vibrationStopAtMs) {
+    if (!deviceConnected || otaUploadActive) {
         stopGamepadVibration();
     }
 }
@@ -638,8 +654,7 @@ int updateTractionLimit(int leftTarget, int rightTarget, int forwardAbs, int tur
     bool pivotingFast = forwardAbs <= 20 && turnAbs > HIGH_SPEED_TURN_START;
     bool steeringFast = forwardAbs > HIGH_SPEED_TURN_START && turnAbs > (MOTOR_MAX * 45 / 100);
     bool slipRisk = false;
-    uint8_t vibrationLeft = 0;
-    uint8_t vibrationRight = 0;
+    updateWheelSpeedVibration(leftWheelSpeed, rightWheelSpeed, commandAbs);
 
     if (tractionSampleReady && highCommand) {
         float leftDelta = fabs(leftWheelSpeed - lastLeftWheelSpeed);
@@ -658,26 +673,6 @@ int updateTractionLimit(int leftTarget, int rightTarget, int forwardAbs, int tur
         if (accelDelta > ACCEL_JOLT_THRESHOLD && (pivotingFast || steeringFast)) {
             slipRisk = true;
         }
-
-        if (slipRisk) {
-            int wheelFeedback = constrain(map(static_cast<int>(wheelDelta), 8, 35, 45, VIBRATION_MAX_SENSOR_STRENGTH),
-                                          45, VIBRATION_MAX_SENSOR_STRENGTH);
-            int accelFeedback = constrain(map(accelDelta, ACCEL_JOLT_THRESHOLD, ACCEL_JOLT_THRESHOLD * 3,
-                                          45, VIBRATION_MAX_SENSOR_STRENGTH),
-                                          45, VIBRATION_MAX_SENSOR_STRENGTH);
-            uint8_t strength = static_cast<uint8_t>(max(wheelFeedback, accelFeedback));
-
-            if (leftDelta > rightDelta + 3.0f || leftWheelSpeed > rightWheelSpeed + 8.0f) {
-                vibrationLeft = strength;
-                vibrationRight = strength / 2;
-            } else if (rightDelta > leftDelta + 3.0f || rightWheelSpeed > leftWheelSpeed + 8.0f) {
-                vibrationLeft = strength / 2;
-                vibrationRight = strength;
-            } else {
-                vibrationLeft = strength;
-                vibrationRight = strength;
-            }
-        }
     }
 
     lastLeftWheelSpeed = leftWheelSpeed;
@@ -686,7 +681,6 @@ int updateTractionLimit(int leftTarget, int rightTarget, int forwardAbs, int tur
     tractionSampleReady = true;
 
     if (slipRisk) {
-        startSensorVibration(vibrationLeft, vibrationRight, VIBRATION_PULSE_MS);
         tractionLimitPercent = TRACTION_RELEASE_PERCENT;
     } else if (tractionLimitPercent < 100) {
         tractionLimitPercent = min(100, tractionLimitPercent + TRACTION_RECOVER_STEP);
